@@ -264,3 +264,19 @@ jobs:
           gh api \
             repos/$REPO/issues/$PR_NUMBER/labels \
             -f labels='["copilot-ci-fix-requested"]'
+
+      # ── Step 7: Auto-approve Copilot PR workflows ─────────────
+      - name: Auto-approve pending workflows on Copilot PRs
+        if: steps.find_pr.outputs.skip != 'true' && steps.check_limit.outputs.exceeded != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
+          REPO: ${{ github.repository }}
+        run: |
+          # Find all copilot/* branches with pending workflow approvals
+          PENDING_RUNS=$(gh api "repos/$REPO/actions/runs?status=action_required" \
+            --jq '.workflow_runs[] | select(.head_branch | startswith("copilot/")) | .id')
+
+          for RUN_ID in $PENDING_RUNS; do
+            echo "✅ Approving workflow run $RUN_ID"
+            gh api "repos/$REPO/actions/runs/$RUN_ID/approve" -X POST || true
+          done
