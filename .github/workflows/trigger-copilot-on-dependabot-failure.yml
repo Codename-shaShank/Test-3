@@ -1,0 +1,266 @@
+name: trigger-copilot-on-dependabot-failure
+
+on:
+  workflow_run:
+    # Name of your test workflow (the one that runs tests for PRs)
+    workflows: ["Tests"]
+    types: [completed]
+
+# ──────────────────────────────────────────────────────────────
+# Max retry iterations before giving up (prevents infinite loops)
+# ──────────────────────────────────────────────────────────────
+env:
+  MAX_COPILOT_RETRIES: "5"
+  RETRY_LABEL: "copilot-fix-attempt"
+
+jobs:
+  trigger-copilot:
+    # Only when the Tests workflow FAILED on a Dependabot PR branch
+    if: >
+      ${{
+        github.event.workflow_run.conclusion == 'failure' &&
+        github.event.workflow_run.event == 'pull_request' &&
+        startsWith(github.event.workflow_run.head_branch, 'dependabot/') }}
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── Step 1: Resolve the PR number ─────────────────────────
+      - name: Resolve PR number
+        id: find_pr
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          # Start empty, then resolve by searching open PR for the branch
+          PR_NUMBER=""
+
+          # Resolve PR by branch name
+          if [[ -z "$PR_NUMBER" || "$PR_NUMBER" == "null" ]]; then
+            PR_NUMBER=$(gh api "repos/$REPO/pulls?head=${REPO%%/*}:$BRANCH&state=open" \
+              --jq '.[0].number // empty')
+          fi
+
+          if [[ -z "$PR_NUMBER" ]]; then
+            echo "⚠️  Could not find an open PR for branch $BRANCH. Skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT" 
+            exit 0
+          fi
+
+          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "✅ Found PR #$PR_NUMBER"
+
+      # ── Step 2: Count previous Copilot attempts ───────────────
+      - name: Count previous attempts
+        if: steps.find_pr.outputs.skip != 'true'
+        id: count
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.find_pr.outputs.pr_number }}
+        run: |
+          # Count comments that contain our retry marker
+          ATTEMPT_COUNT=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments" \
+            --jq '[.[] | select(.body | contains("<!-- copilot-fix-attempt -->"))] | length')
+
+          ATTEMPT_COUNT=$((ATTEMPT_COUNT + 1))
+          echo "attempt=$ATTEMPT_COUNT" >> "$GITHUB_OUTPUT"
+          echo "📊 This is Copilot fix attempt #$ATTEMPT_COUNT (max: $MAX_COPILOT_RETRIES)"
+
+      # ── Step 3: Check if we've exceeded max retries ───────────
+      - name: Check retry limit
+        if: steps.find_pr.outputs.skip != 'true'
+        id: check_limit
+        run: |
+          ATTEMPT=${{ steps.count.outputs.attempt }}
+          if [[ "$ATTEMPT" -gt "$MAX_COPILOT_RETRIES" ]]; then
+            echo "🛑 Max retries ($MAX_COPILOT_RETRIES) exceeded. Stopping automation."
+            echo "exceeded=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exceeded=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── Step 4: Post max-retry notice if limit exceeded ───────
+      - name: Post max-retry notice
+        if: steps.check_limit.outputs.exceeded == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.find_pr.outputs.pr_number }}
+        run: |
+          body=$(cat <<'EOF'
+          <!-- copilot-fix-max-reached -->
+          ## 🛑 Automated fix limit reached
+
+          Copilot has attempted **${{ env.MAX_COPILOT_RETRIES }}** fixes and CI is still failing.
+
+          **Manual intervention is required.** Please review:
+          - The latest [failing CI run](${{ github.event.workflow_run.html_url }})
+          - Previous Copilot fix PRs on this branch
+
+          Consider:
+          1. Manually fixing the remaining issues
+          2. Closing this Dependabot PR if the upgrade isn't feasible right now
+          3. Increasing `MAX_COPILOT_RETRIES` if Copilot was making progress
+          EOF
+          )
+          gh api "repos/$REPO/issues/$PR_NUMBER/comments" -f body="$body"
+
+      # ── Step 5: Fetch CI failure logs ─────────────────────────
+      - name: Fetch failure logs
+        if: steps.find_pr.outputs.skip != 'true' && steps.check_limit.outputs.exceeded != 'true'
+        id: logs
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          # Get failed job names and their step failure messages
+          FAILED_JOBS=$(gh api "repos/$REPO/actions/runs/$RUN_ID/jobs" \
+            --jq '[.jobs[] | select(.conclusion == "failure") | {name: .name, steps: [.steps[] | select(.conclusion == "failure") | .name]}]')
+
+          echo "Failed jobs: $FAILED_JOBS"
+
+          # Download and extract logs (last 200 lines per failed job)
+          mkdir -p /tmp/ci-logs
+          gh run download "$RUN_ID" --repo "$REPO" --dir /tmp/ci-logs 2>/dev/null || true
+
+          # Also try fetching logs via API
+          LOG_SNIPPET=""
+          for JOB_ID in $(gh api "repos/$REPO/actions/runs/$RUN_ID/jobs" \
+            --jq '.jobs[] | select(.conclusion == "failure") | .id'); do
+            JOB_LOG=$(gh api "repos/$REPO/actions/jobs/$JOB_ID/logs" 2>/dev/null | tail -150 || echo "Could not fetch logs for job $JOB_ID")
+            LOG_SNIPPET="${LOG_SNIPPET}\n--- Job $JOB_ID ---\n${JOB_LOG}\n"
+          done
+
+          # Truncate to avoid hitting comment size limits (max ~4000 chars of logs)
+          LOG_SNIPPET=$(echo -e "$LOG_SNIPPET" | tail -c 4000)
+
+          # Save to file for the next step
+          echo "$FAILED_JOBS" > /tmp/failed_jobs.json
+          echo -e "$LOG_SNIPPET" > /tmp/failure_logs.txt
+
+          # Set outputs
+          {
+            echo "failed_jobs<<GHEOF"
+            echo "$FAILED_JOBS"
+            echo "GHEOF"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "log_snippet<<GHEOF"
+            cat /tmp/failure_logs.txt
+            echo "GHEOF"
+          } >> "$GITHUB_OUTPUT"
+
+      # ── Step 6: Post comment to trigger Copilot ───────────────
+      - name: Post comment to trigger Copilot
+        if: steps.find_pr.outputs.skip != 'true' && steps.check_limit.outputs.exceeded != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
+          REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+          PR_NUMBER: ${{ steps.find_pr.outputs.pr_number }}
+          ATTEMPT: ${{ steps.count.outputs.attempt }}
+          FAILED_JOBS: ${{ steps.logs.outputs.failed_jobs }}
+          LOG_SNIPPET: ${{ steps.logs.outputs.log_snippet }}
+        run: |
+          # Determine if this is a first attempt or a retry
+          if [[ "$ATTEMPT" -eq 1 ]]; then
+            ATTEMPT_HEADER="## 🤖 Copilot: Fix CI Failures (Attempt #${ATTEMPT})"
+            CONTEXT_NOTE="This is the **first** automated fix attempt."
+          else
+            ATTEMPT_HEADER="## 🔄 Copilot: Retry Fix CI Failures (Attempt #${ATTEMPT} of ${MAX_COPILOT_RETRIES})"
+            CONTEXT_NOTE="Previous fix attempts did **not** fully resolve CI. Review what was already tried in earlier comments and PRs on this branch, then fix the **remaining** issues. Do **not** repeat changes that were already applied."
+          fi
+
+          # Build the comment body
+          body=$(cat <<EOF
+          <!-- copilot-fix-attempt -->
+          ${ATTEMPT_HEADER}
+
+          ${CONTEXT_NOTE}
+
+          ---
+
+          @copilot
+
+          Please take full ownership of fixing this Dependabot PR so that **all CI checks pass on this branch**.
+
+          ### Goal
+
+          - Analyze this Dependabot PR and the **current CI failures** on this branch.
+          - Make **all necessary code-level changes** (app code, config, assets, migrations, tests, and CI config if needed) so that the same CI workflows that run on this PR **all pass successfully**.
+          - Create a **new pull request that targets this Dependabot branch** with your fixes.
+          - After I merge your PR into this branch, CI on this branch should be **green with no failing jobs**.
+
+          ### Latest CI Failure Details
+
+          🔗 **Failing CI run:** ${RUN_URL}
+          📊 **Attempt:** #${ATTEMPT} of ${MAX_COPILOT_RETRIES}
+
+          **Failed jobs:**
+          \`\`\`json
+          ${FAILED_JOBS}
+          \`\`\`
+
+          **Failure log excerpt (last ~150 lines per failed job):**
+          \`\`\`
+          ${LOG_SNIPPET}
+          \`\`\`
+
+          ### How to work
+
+          1. **Understand the failures**
+             - Read the failure logs above carefully.
+             - Also check the full CI run at the link above for complete context.
+             - Identify the **exact errors** (e.g., duplicate migrations, Tailwind build errors, failing tests, missing dependencies, schema mismatches, etc.).
+
+          2. **Plan and apply fixes**
+             - Update or remove migrations, schema, views, tests, config, or CI steps as needed.
+             - Do **not** downgrade the dependencies; keep the versions from this Dependabot PR and adapt the code/config to them.
+             - Keep changes **minimal and focused** only on what is needed to get CI green.
+             - If this is a retry, check what was already changed in previous fix PRs and build on top of those changes.
+
+          3. **Run CI yourself in your environment**
+             - Run the same test commands locally in your ephemeral environment:
+               \`\`\`bash
+               bin/rails test:prepare
+               bin/rails test
+               \`\`\`
+             - If they still fail, **iterate on your changes and re-run tests** until they pass or you hit a hard blocker.
+
+          4. **Create the PR to this branch**
+             - Open a new PR **from your Copilot branch into this Dependabot branch**.
+             - Title the PR: \`AI GEM UPGRADE\`
+             - Include a clear description explaining:
+               - What broke and why.
+               - Exactly what files you changed and why those changes fix the CI failures.
+               - What attempt number this is.
+
+          5. **Do not stop on the first failure**
+             - Keep iterating within this session until:
+               - The tests and CI commands you run are passing, **and**
+               - You are confident that merging your PR into this branch will let the GitHub CI checks pass as well.
+             - If you hit a hard blocker you truly cannot solve, explain clearly what is blocking you.
+
+          ---
+          _This comment was auto-generated by the Dependabot CI fix automation (attempt #${ATTEMPT})._
+          EOF
+          )
+
+          # Post the comment (triggers Copilot)
+          gh api "repos/$REPO/issues/$PR_NUMBER/comments" -f body="$body"
+          echo "✅ Posted Copilot trigger comment (attempt #$ATTEMPT) on PR #$PR_NUMBER"
+
+      - name: Add label to Dependabot PR
+        if: steps.find_pr.outputs.skip != 'true' && steps.check_limit.outputs.exceeded != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.find_pr.outputs.pr_number }}
+        run: |
+          gh api \
+            repos/$REPO/issues/$PR_NUMBER/labels \
+            -f labels='["copilot-ci-fix-requested"]'
