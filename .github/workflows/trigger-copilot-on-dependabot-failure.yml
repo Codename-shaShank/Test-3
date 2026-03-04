@@ -22,17 +22,13 @@ jobs:
         github.event.workflow_run.event == 'pull_request' &&
         startsWith(github.event.workflow_run.head_branch, 'dependabot/') }}
     runs-on: ubuntu-latest
-    permissions:
-      issues: write
-      contents: read
-      pull-requests: write
 
     steps:
       # ── Step 1: Resolve the PR number ─────────────────────────
       - name: Resolve PR number
         id: find_pr
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
           REPO: ${{ github.repository }}
           BRANCH: ${{ github.event.workflow_run.head_branch }}
         run: |
@@ -60,7 +56,7 @@ jobs:
         if: steps.find_pr.outputs.skip != 'true'
         id: count
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ steps.find_pr.outputs.pr_number }}
         run: |
@@ -89,7 +85,7 @@ jobs:
       - name: Post max-retry notice
         if: steps.check_limit.outputs.exceeded == 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ steps.find_pr.outputs.pr_number }}
         run: |
@@ -116,7 +112,7 @@ jobs:
         if: steps.find_pr.outputs.skip != 'true' && steps.check_limit.outputs.exceeded != 'true'
         id: logs
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
           REPO: ${{ github.repository }}
           RUN_ID: ${{ github.event.workflow_run.id }}
         run: |
@@ -162,7 +158,7 @@ jobs:
       - name: Post comment to trigger Copilot
         if: steps.find_pr.outputs.skip != 'true' && steps.check_limit.outputs.exceeded != 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
           REPO: ${{ github.repository }}
           RUN_URL: ${{ github.event.workflow_run.html_url }}
           PR_NUMBER: ${{ steps.find_pr.outputs.pr_number }}
@@ -261,7 +257,7 @@ jobs:
       - name: Add label to Dependabot PR
         if: steps.find_pr.outputs.skip != 'true' && steps.check_limit.outputs.exceeded != 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ steps.find_pr.outputs.pr_number }}
         run: |
