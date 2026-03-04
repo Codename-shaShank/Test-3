@@ -72,6 +72,8 @@ group :test do
   gem "capybara"
   gem "selenium-webdriver"
 
+  # Pin minitest to 5.x; minitest 6.x changed run() signature incompatible with Rails 7.0
+  gem "minitest", "~> 5.1"
 end
 
 gem "chartkick", "~> 5.0"
