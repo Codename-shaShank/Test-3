@@ -271,10 +271,14 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
           REPO: ${{ github.repository }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
-          # Find all copilot/* branches with pending workflow approvals
+          set -e
+
+          # Find pending workflow approvals for this SHA
           PENDING_RUNS=$(gh api "repos/$REPO/actions/runs?status=action_required" \
-            --jq '.workflow_runs[] | select(.head_branch | startswith("copilot/")) | .id')
+            | jq -r --arg sha "$HEAD_SHA" \
+              '.workflow_runs[] | select(.head_sha == $sha) | .id')
 
           for RUN_ID in $PENDING_RUNS; do
             echo "✅ Approving workflow run $RUN_ID"

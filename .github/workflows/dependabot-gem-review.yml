@@ -1,0 +1,73 @@
+name: Gem Upgrade Review
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+    paths:
+      - "Gemfile"
+      - "Gemfile.lock"
+      - "*.gemspec"
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  
+jobs:
+  review-gems:
+    if: github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    env:
+      GEM_REVIEW_PATH: gem_review.md
+
+    steps:
+      - name: Checkout base branch (trusted code)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 0  
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3.0"   
+          bundler-cache: false
+
+      - name: Fetch PR Gemfile.lock safely
+        run: |
+          git fetch origin ${{ github.event.pull_request.head.sha }} --depth=1
+          git show ${{ github.event.pull_request.head.sha }}:Gemfile.lock > pr_gemfile.lock
+
+
+      - name: Generate dependency review comment
+        run: ruby .github/scripts/gem_diff.rb
+        env:
+          PR_GEMFILE_LOCK_PATH: pr_gemfile.lock
+
+      - name: Verify gem_review.md exists
+        run: |
+          test -f "$GEM_REVIEW_PATH"
+          test -s "$GEM_REVIEW_PATH"
+          echo "=== gem_review.md contents ==="
+          cat "$GEM_REVIEW_PATH"
+          echo "=== end ==="
+
+      - name: Find existing gem review comment
+        id: find-existing-gem-review
+        if: github.event.pull_request != null
+        uses: peter-evans/find-comment@v3
+        with:
+          token: ${{ github.token }}
+          issue-number: ${{ github.event.pull_request.number }}
+          comment-author: github-actions[bot]
+          body-includes: "## Dependency change summary"
+
+      - name: Comment on PR with dependency summary
+        if: github.event.pull_request != null
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          token: ${{ github.token }}
+          issue-number: ${{ github.event.pull_request.number }}
+          body-file: ${{ env.GEM_REVIEW_PATH }}
+          comment-id: ${{ steps.find-existing-gem-review.outputs.comment-id }}
+          edit-mode: replace
