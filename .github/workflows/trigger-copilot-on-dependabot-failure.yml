@@ -2,9 +2,13 @@ name: trigger-copilot-on-dependabot-failure
 
 on:
   workflow_run:
-    # Name of your test workflow (the one that runs tests for PRs)
     workflows: ["Tests"]
     types: [completed]
+
+# ──────────────────────────────────────────────────────────────
+# Least-privilege permissions — all API calls use GH_PAT_FOR_COPILOT
+# ──────────────────────────────────────────────────────────────
+permissions: {}
 
 # ──────────────────────────────────────────────────────────────
 # Max retry iterations before giving up (prevents infinite loops)
@@ -12,16 +16,25 @@ on:
 env:
   MAX_COPILOT_RETRIES: "5"
   RETRY_LABEL: "copilot-fix-attempt"
+  COPILOT_MARKER: "<!-- copilot-fix-attempt -->"
+  MAX_REACHED_MARKER: "<!-- copilot-fix-max-reached -->"
+
+# ──────────────────────────────────────────────────────────────
+# Prevent parallel runs for the same Dependabot branch
+# ──────────────────────────────────────────────────────────────
+concurrency:
+  group: copilot-fix-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: true
 
 jobs:
   trigger-copilot:
     # Only when the Tests workflow FAILED on a Dependabot PR branch
-    if: >
-      ${{
-        github.event.workflow_run.conclusion == 'failure' &&
-        github.event.workflow_run.event == 'pull_request' &&
-        startsWith(github.event.workflow_run.head_branch, 'dependabot/') }}
+    if: >-
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      startsWith(github.event.workflow_run.head_branch, 'dependabot/')
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
       # ── Step 1: Resolve the PR number ─────────────────────────
@@ -32,24 +45,23 @@ jobs:
           REPO: ${{ github.repository }}
           BRANCH: ${{ github.event.workflow_run.head_branch }}
         run: |
-          # Start empty, then resolve by searching open PR for the branch
-          PR_NUMBER=""
+          set -euo pipefail
 
-          # Resolve PR by branch name
-          if [[ -z "$PR_NUMBER" || "$PR_NUMBER" == "null" ]]; then
-            PR_NUMBER=$(gh api "repos/$REPO/pulls?head=${REPO%%/*}:$BRANCH&state=open" \
-              --jq '.[0].number // empty')
-          fi
+          PR_NUMBER=$(gh api "repos/${REPO}/pulls" \
+            --method GET \
+            -f head="${REPO%%/*}:${BRANCH}" \
+            -f state=open \
+            --jq '.[0].number // empty')
 
-          if [[ -z "$PR_NUMBER" ]]; then
-            echo "⚠️  Could not find an open PR for branch $BRANCH. Skipping."
-            echo "skip=true" >> "$GITHUB_OUTPUT" 
+          if [[ -z "${PR_NUMBER:-}" ]]; then
+            echo "⚠️  No open PR found for branch ${BRANCH}. Skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "pr_number=${PR_NUMBER}" >> "$GITHUB_OUTPUT"
           echo "skip=false" >> "$GITHUB_OUTPUT"
-          echo "✅ Found PR #$PR_NUMBER"
+          echo "✅ Found PR #${PR_NUMBER}"
 
       # ── Step 2: Count previous Copilot attempts ───────────────
       - name: Count previous attempts
@@ -60,91 +72,118 @@ jobs:
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ steps.find_pr.outputs.pr_number }}
         run: |
-          # Count comments that contain our retry marker
-          ATTEMPT_COUNT=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments" \
-            --jq '[.[] | select(.body | contains("<!-- copilot-fix-attempt -->"))] | length')
+          set -euo pipefail
 
-          ATTEMPT_COUNT=$((ATTEMPT_COUNT + 1))
-          echo "attempt=$ATTEMPT_COUNT" >> "$GITHUB_OUTPUT"
-          echo "📊 This is Copilot fix attempt #$ATTEMPT_COUNT (max: $MAX_COPILOT_RETRIES)"
+          # Paginate all comments to get an accurate count
+          ATTEMPT_COUNT=$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+            --jq "[.[] | select(.body | contains(\"$COPILOT_MARKER\"))] | length" \
+            | paste -sd+ - | bc)
 
-      # ── Step 3: Check if we've exceeded max retries ───────────
+          ATTEMPT_COUNT=$(( ATTEMPT_COUNT + 1 ))
+          echo "attempt=${ATTEMPT_COUNT}" >> "$GITHUB_OUTPUT"
+          echo "📊 Copilot fix attempt #${ATTEMPT_COUNT} (max: ${MAX_COPILOT_RETRIES})"
+
+      # ── Step 3: Gate on retry limit ───────────────────────────
       - name: Check retry limit
         if: steps.find_pr.outputs.skip != 'true'
         id: check_limit
+        env:
+          ATTEMPT: ${{ steps.count.outputs.attempt }}
         run: |
-          ATTEMPT=${{ steps.count.outputs.attempt }}
-          if [[ "$ATTEMPT" -gt "$MAX_COPILOT_RETRIES" ]]; then
-            echo "🛑 Max retries ($MAX_COPILOT_RETRIES) exceeded. Stopping automation."
+          set -euo pipefail
+
+          if [[ "${ATTEMPT}" -gt "${MAX_COPILOT_RETRIES}" ]]; then
+            echo "🛑 Max retries (${MAX_COPILOT_RETRIES}) exceeded. Stopping."
             echo "exceeded=true" >> "$GITHUB_OUTPUT"
           else
             echo "exceeded=false" >> "$GITHUB_OUTPUT"
           fi
 
-      # ── Step 4: Post max-retry notice if limit exceeded ───────
+      # ── Step 4: Post max-retry notice (idempotent) ────────────
       - name: Post max-retry notice
-        if: steps.check_limit.outputs.exceeded == 'true'
+        if: >-
+          steps.find_pr.outputs.skip != 'true' &&
+          steps.check_limit.outputs.exceeded == 'true'
         env:
           GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ steps.find_pr.outputs.pr_number }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
         run: |
-          body=$(cat <<'EOF'
-          <!-- copilot-fix-max-reached -->
+          set -euo pipefail
+
+          # Skip if we already posted a max-reached notice
+          EXISTING=$(gh api --paginate "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+            --jq "[.[] | select(.body | contains(\"$MAX_REACHED_MARKER\"))] | length" \
+            | paste -sd+ - | bc)
+
+          if [[ "${EXISTING}" -gt 0 ]]; then
+            echo "ℹ️  Max-reached notice already posted. Skipping duplicate."
+            exit 0
+          fi
+
+          cat > /tmp/max_reached_body.md <<BODY
+          ${MAX_REACHED_MARKER}
           ## 🛑 Automated fix limit reached
 
-          Copilot has attempted **${{ env.MAX_COPILOT_RETRIES }}** fixes and CI is still failing.
+          Copilot has attempted **${MAX_COPILOT_RETRIES}** fixes and CI is still failing.
 
           **Manual intervention is required.** Please review:
-          - The latest [failing CI run](${{ github.event.workflow_run.html_url }})
+          - The latest [failing CI run](${RUN_URL})
           - Previous Copilot fix PRs on this branch
 
           Consider:
           1. Manually fixing the remaining issues
           2. Closing this Dependabot PR if the upgrade isn't feasible right now
-          3. Increasing `MAX_COPILOT_RETRIES` if Copilot was making progress
-          EOF
-          )
-          gh api "repos/$REPO/issues/$PR_NUMBER/comments" -f body="$body"
+          3. Increasing \`MAX_COPILOT_RETRIES\` if Copilot was making progress
+          BODY
+
+          gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+            --field body=@/tmp/max_reached_body.md
 
       # ── Step 5: Fetch CI failure logs ─────────────────────────
       - name: Fetch failure logs
-        if: steps.find_pr.outputs.skip != 'true' && steps.check_limit.outputs.exceeded != 'true'
+        if: >-
+          steps.find_pr.outputs.skip != 'true' &&
+          steps.check_limit.outputs.exceeded != 'true'
         id: logs
         env:
           GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
           REPO: ${{ github.repository }}
           RUN_ID: ${{ github.event.workflow_run.id }}
         run: |
-          # Get failed job names and their step failure messages
-          FAILED_JOBS=$(gh api "repos/$REPO/actions/runs/$RUN_ID/jobs" \
-            --jq '[.jobs[] | select(.conclusion == "failure") | {name: .name, steps: [.steps[] | select(.conclusion == "failure") | .name]}]')
+          set -euo pipefail
 
-          echo "Failed jobs: $FAILED_JOBS"
+          # ── Structured failed-job metadata ──
+          gh api "repos/${REPO}/actions/runs/${RUN_ID}/jobs" \
+            --jq '[.jobs[] | select(.conclusion == "failure")
+                   | {name: .name,
+                      steps: [.steps[] | select(.conclusion == "failure") | .name]}]' \
+            > /tmp/failed_jobs.json
 
-          # Download and extract logs (last 200 lines per failed job)
-          mkdir -p /tmp/ci-logs
-          gh run download "$RUN_ID" --repo "$REPO" --dir /tmp/ci-logs 2>/dev/null || true
+          echo "::group::Failed jobs JSON"
+          cat /tmp/failed_jobs.json
+          echo "::endgroup::"
 
-          # Also try fetching logs via API
-          LOG_SNIPPET=""
-          for JOB_ID in $(gh api "repos/$REPO/actions/runs/$RUN_ID/jobs" \
-            --jq '.jobs[] | select(.conclusion == "failure") | .id'); do
-            JOB_LOG=$(gh api "repos/$REPO/actions/jobs/$JOB_ID/logs" 2>/dev/null | tail -150 || echo "Could not fetch logs for job $JOB_ID")
-            LOG_SNIPPET="${LOG_SNIPPET}\n--- Job $JOB_ID ---\n${JOB_LOG}\n"
-          done
+          # ── Per-job log excerpts ──
+          : > /tmp/failure_logs.txt   # truncate
 
-          # Truncate to avoid hitting comment size limits (max ~4000 chars of logs)
-          LOG_SNIPPET=$(echo -e "$LOG_SNIPPET" | tail -c 4000)
+          while IFS= read -r JOB_ID; do
+            printf '\n--- Job %s ---\n' "${JOB_ID}" >> /tmp/failure_logs.txt
+            gh api "repos/${REPO}/actions/jobs/${JOB_ID}/logs" 2>/dev/null \
+              | tail -150 >> /tmp/failure_logs.txt \
+              || printf 'Could not fetch logs for job %s\n' "${JOB_ID}" >> /tmp/failure_logs.txt
+          done < <(gh api "repos/${REPO}/actions/runs/${RUN_ID}/jobs" \
+                     --jq '.jobs[] | select(.conclusion == "failure") | .id')
 
-          # Save to file for the next step
-          echo "$FAILED_JOBS" > /tmp/failed_jobs.json
-          echo -e "$LOG_SNIPPET" > /tmp/failure_logs.txt
+          # Truncate to ~4 000 chars to stay within comment limits
+          tail -c 4000 /tmp/failure_logs.txt > /tmp/failure_logs_truncated.txt
+          mv /tmp/failure_logs_truncated.txt /tmp/failure_logs.txt
 
-          # Set outputs
+          # ── Expose as outputs via delimiter-safe heredocs ──
           {
             echo "failed_jobs<<GHEOF"
-            echo "$FAILED_JOBS"
+            cat /tmp/failed_jobs.json
             echo "GHEOF"
           } >> "$GITHUB_OUTPUT"
 
@@ -154,33 +193,39 @@ jobs:
             echo "GHEOF"
           } >> "$GITHUB_OUTPUT"
 
-      # ── Step 6: Post comment to trigger Copilot ───────────────
-      - name: Post comment to trigger Copilot
-        if: steps.find_pr.outputs.skip != 'true' && steps.check_limit.outputs.exceeded != 'true'
+      # ── Step 6: Build & post Copilot trigger comment ──────────
+      #
+      #   SECURITY NOTE: The comment body is written to a file and
+      #   posted via `--field body=@file` so that CI log content can
+      #   never be interpreted as shell code or GitHub expression.
+      # ────────────────────────────────────────────────────────────
+      - name: Build Copilot trigger comment
+        if: >-
+          steps.find_pr.outputs.skip != 'true' &&
+          steps.check_limit.outputs.exceeded != 'true'
         env:
-          GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
-          REPO: ${{ github.repository }}
           RUN_URL: ${{ github.event.workflow_run.html_url }}
-          PR_NUMBER: ${{ steps.find_pr.outputs.pr_number }}
           ATTEMPT: ${{ steps.count.outputs.attempt }}
-          FAILED_JOBS: ${{ steps.logs.outputs.failed_jobs }}
-          LOG_SNIPPET: ${{ steps.logs.outputs.log_snippet }}
         run: |
-          # Determine if this is a first attempt or a retry
-          if [[ "$ATTEMPT" -eq 1 ]]; then
-            ATTEMPT_HEADER="## 🤖 Copilot: Fix CI Failures (Attempt #${ATTEMPT})"
-            CONTEXT_NOTE="This is the **first** automated fix attempt."
+          set -euo pipefail
+
+          if [[ "${ATTEMPT}" -eq 1 ]]; then
+            HEADER="## 🤖 Copilot: Fix CI Failures (Attempt #${ATTEMPT})"
+            CONTEXT="This is the **first** automated fix attempt."
           else
-            ATTEMPT_HEADER="## 🔄 Copilot: Retry Fix CI Failures (Attempt #${ATTEMPT} of ${MAX_COPILOT_RETRIES})"
-            CONTEXT_NOTE="Previous fix attempts did **not** fully resolve CI. Review what was already tried in earlier comments and PRs on this branch, then fix the **remaining** issues. Do **not** repeat changes that were already applied."
+            HEADER="## 🔄 Copilot: Retry Fix CI Failures (Attempt #${ATTEMPT} of ${MAX_COPILOT_RETRIES})"
+            CONTEXT="Previous fix attempts did **not** fully resolve CI. Review what was already tried in earlier comments and PRs on this branch, then fix the **remaining** issues. Do **not** repeat changes that were already applied."
           fi
 
-          # Build the comment body
-          body=$(cat <<EOF
-          <!-- copilot-fix-attempt -->
-          ${ATTEMPT_HEADER}
+          # Read log artifacts produced by the previous step
+          FAILED_JOBS_JSON=$(cat /tmp/failed_jobs.json 2>/dev/null || echo '[]')
+          LOG_TEXT=$(cat /tmp/failure_logs.txt 2>/dev/null || echo 'No logs captured.')
 
-          ${CONTEXT_NOTE}
+          cat > /tmp/copilot_comment.md <<COMMENT
+          ${COPILOT_MARKER}
+          ${HEADER}
+
+          ${CONTEXT}
 
           ---
 
@@ -202,12 +247,12 @@ jobs:
 
           **Failed jobs:**
           \`\`\`json
-          ${FAILED_JOBS}
+          ${FAILED_JOBS_JSON}
           \`\`\`
 
           **Failure log excerpt (last ~150 lines per failed job):**
           \`\`\`
-          ${LOG_SNIPPET}
+          ${LOG_TEXT}
           \`\`\`
 
           ### How to work
@@ -247,40 +292,71 @@ jobs:
 
           ---
           _This comment was auto-generated by the Dependabot CI fix automation (attempt #${ATTEMPT})._
-          EOF
-          )
+          COMMENT
 
-          # Post the comment (triggers Copilot)
-          gh api "repos/$REPO/issues/$PR_NUMBER/comments" -f body="$body"
-          echo "✅ Posted Copilot trigger comment (attempt #$ATTEMPT) on PR #$PR_NUMBER"
+      - name: Post Copilot trigger comment
+        if: >-
+          steps.find_pr.outputs.skip != 'true' &&
+          steps.check_limit.outputs.exceeded != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.find_pr.outputs.pr_number }}
+          ATTEMPT: ${{ steps.count.outputs.attempt }}
+        run: |
+          set -euo pipefail
 
+          gh api "repos/${REPO}/issues/${PR_NUMBER}/comments" \
+            --field body=@/tmp/copilot_comment.md
+
+          echo "✅ Posted Copilot trigger comment (attempt #${ATTEMPT}) on PR #${PR_NUMBER}"
+
+      # ── Step 7: Label the Dependabot PR ───────────────────────
       - name: Add label to Dependabot PR
-        if: steps.find_pr.outputs.skip != 'true' && steps.check_limit.outputs.exceeded != 'true'
+        if: >-
+          steps.find_pr.outputs.skip != 'true' &&
+          steps.check_limit.outputs.exceeded != 'true'
         env:
           GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ steps.find_pr.outputs.pr_number }}
         run: |
-          gh api \
-            repos/$REPO/issues/$PR_NUMBER/labels \
-            -f labels='["copilot-ci-fix-requested"]'
+          set -euo pipefail
 
-      # ── Step 7: Auto-approve Copilot PR workflows ─────────────
+          # Ensure the label exists (idempotent)
+          gh api "repos/${REPO}/labels" \
+            --method POST \
+            --field name="copilot-ci-fix-requested" \
+            --field color="1d76db" \
+            --field description="Copilot has been asked to fix CI on this PR" \
+            2>/dev/null || true
+
+          gh api "repos/${REPO}/issues/${PR_NUMBER}/labels" \
+            --method POST \
+            --input - <<< '{"labels":["copilot-ci-fix-requested"]}'
+
+      # ── Step 8: Auto-approve pending Copilot workflows ────────
       - name: Auto-approve pending workflows on Copilot PRs
-        if: steps.find_pr.outputs.skip != 'true' && steps.check_limit.outputs.exceeded != 'true'
+        if: >-
+          steps.find_pr.outputs.skip != 'true' &&
+          steps.check_limit.outputs.exceeded != 'true'
         env:
           GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
           REPO: ${{ github.repository }}
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
-          set -e
+          set -euo pipefail
 
-          # Find pending workflow approvals for this SHA
-          PENDING_RUNS=$(gh api "repos/$REPO/actions/runs?status=action_required" \
-            | jq -r --arg sha "$HEAD_SHA" \
-              '.workflow_runs[] | select(.head_sha == $sha) | .id')
+          PENDING_RUNS=$(gh api "repos/${REPO}/actions/runs?status=action_required" \
+            --jq --arg sha "${HEAD_SHA}" \
+              '[.workflow_runs[] | select(.head_sha == $sha) | .id] | .[]')
 
-          for RUN_ID in $PENDING_RUNS; do
-            echo "✅ Approving workflow run $RUN_ID"
-            gh api "repos/$REPO/actions/runs/$RUN_ID/approve" -X POST || true
-          done
+          if [[ -z "${PENDING_RUNS:-}" ]]; then
+            echo "ℹ️  No pending workflow runs to approve."
+            exit 0
+          fi
+
+          while IFS= read -r RUN_ID; do
+            echo "✅ Approving workflow run ${RUN_ID}"
+            gh api "repos/${REPO}/actions/runs/${RUN_ID}/approve" --method POST || true
+          done <<< "${PENDING_RUNS}"
