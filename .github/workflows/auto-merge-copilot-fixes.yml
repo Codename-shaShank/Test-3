@@ -1,130 +1,67 @@
-name: Auto Merge Copilot Fixes
+name: Apply Copilot Fixes to Dependabot Branch
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
-
+    # Run when Copilot opens/updates its PR
+    types: [opened, synchronize, reopened, ready_for_review]
 jobs:
-  auto-merge:
+  apply-fixes:
+    # Only for Copilot PRs (head branch starts with "copilot/")
     if: startsWith(github.event.pull_request.head.ref, 'copilot/')
     runs-on: ubuntu-latest
+
     permissions:
       contents: write
       pull-requests: write
 
     steps:
-      # 1️⃣ Always approve any pending workflows on this PR first
-      - name: Approve pending workflow runs
+      - name: Checkout Dependabot (base) branch
+        uses: actions/checkout@v4
+        with:
+          # Base branch of the PR: this is your dependabot/... branch
+          ref: ${{ github.event.pull_request.base.ref }}
+          fetch-depth: 0
+
+      - name: Merge Copilot branch into Dependabot branch
         env:
-          GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
           REPO: ${{ github.repository }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          DEPENDABOT_BRANCH: ${{ github.event.pull_request.base.ref }}
+          COPILOT_BRANCH: ${{ github.event.pull_request.head.ref }}
+          GH_PAT: ${{ secrets.GH_PAT_FOR_COPILOT }}
         run: |
-          PENDING_RUNS=$(gh api "repos/$REPO/actions/runs?status=action_required" \
-            --jq --arg sha "$HEAD_SHA" \
-            '.workflow_runs[] | select(.head_sha == $sha) | .id')
+          set -e
 
-          for RUN_ID in $PENDING_RUNS; do
-            echo "✅ Approving workflow run $RUN_ID"
-            gh api "repos/$REPO/actions/runs/$RUN_ID/approve" -X POST || true
-          done
+          echo "Base (Dependabot) branch: $DEPENDABOT_BRANCH"
+          echo "Copilot branch:         $COPILOT_BRANCH"
 
-      # 2️⃣ Convert Draft → Ready for review
-      - name: Mark PR ready for review
+          git config user.name "ai-gem-upgrade-bot"
+          git config user.email "ai-gem-upgrade-bot@example.com"
+
+          # Use PAT so we can push
+          git remote set-url origin "https://x-access-token:${GH_PAT}@github.com/${REPO}.git"
+
+          # Make sure we have both branches
+          git fetch origin "$DEPENDABOT_BRANCH"
+          git fetch origin "$COPILOT_BRANCH"
+
+          # Ensure we are on the Dependabot branch
+          git checkout "$DEPENDABOT_BRANCH"
+
+          # Merge Copilot branch changes into Dependabot branch
+          git merge --no-ff "origin/$COPILOT_BRANCH" \
+            -m "Merge Copilot fixes from $COPILOT_BRANCH into $DEPENDABOT_BRANCH"
+
+          # Push updated Dependabot branch
+          git push origin "HEAD:$DEPENDABOT_BRANCH"
+
+      - name: Close Copilot PR (optional)
         env:
           GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          DEPENDABOT_BRANCH: ${{ github.event.pull_request.base.ref }}
         run: |
-          IS_DRAFT=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json isDraft --jq '.isDraft')
-          if [[ "$IS_DRAFT" == "true" ]]; then
-            echo "📝 Converting draft to ready..."
-            gh pr ready "$PR_NUMBER" --repo "$REPO"
-            echo "✅ PR is now ready for review"
-          else
-            echo "✅ PR is already ready for review"
-          fi
-
-      # 3️⃣ Poll until CI checks complete (with 30-minute timeout)
-      - name: Wait for CI checks to complete
-        id: ci
-        env:
-          GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
-          REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: |
-          echo "⏳ Waiting for CI checks to complete..."
-          
-          for i in $(seq 1 30); do
-            sleep 60
-
-            # Re-approve any workflows that appeared after draft→ready conversion
-            HEAD_SHA=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid --jq '.headRefOid')
-            PENDING=$(gh api "repos/$REPO/actions/runs?status=action_required" \
-              --jq --arg sha "$HEAD_SHA" \
-              '[.workflow_runs[] | select(.head_sha == $sha)] | length')
-            if [[ "$PENDING" -gt 0 ]]; then
-              echo "🔓 Found $PENDING pending workflows, approving..."
-              gh api "repos/$REPO/actions/runs?status=action_required" \
-                --jq --arg sha "$HEAD_SHA" \
-                '.workflow_runs[] | select(.head_sha == $sha) | .id' | \
-              while read RUN_ID; do
-                gh api "repos/$REPO/actions/runs/$RUN_ID/approve" -X POST || true
-              done
-              sleep 30
-              continue
-            fi
-
-            # Check if all checks are done
-            PENDING_CHECKS=$(gh pr checks "$PR_NUMBER" --repo "$REPO" \
-              --json state --jq '[.[] | select(.state == "PENDING" or .state == "IN_PROGRESS")] | length' \
-              2>/dev/null || echo "0")
-
-            if [[ "$PENDING_CHECKS" == "0" ]]; then
-              echo "✅ All checks completed on attempt $i"
-              
-              # Now check if required checks passed
-              if gh pr checks "$PR_NUMBER" --required --repo "$REPO" 2>/dev/null; then
-                echo "can_merge=true" >> "$GITHUB_OUTPUT"
-                echo "✅ All required checks passed"
-              else
-                echo "can_merge=false" >> "$GITHUB_OUTPUT"
-                echo "❌ Required checks failed — Copilot retry will trigger"
-              fi
-              exit 0
-            fi
-
-            echo "🔄 Attempt $i/30 — $PENDING_CHECKS checks still running..."
-          done
-
-          echo "⏰ Timed out after 30 minutes"
-          echo "can_merge=false" >> "$GITHUB_OUTPUT"
-
-      # 4️⃣ Approve PR (uses GITHUB_TOKEN = different actor than merger)
-      - name: Approve PR
-        if: steps.ci.outputs.can_merge == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          REPO: ${{ github.repository }}
-        run: |
-          gh pr review "$PR_NUMBER" --approve \
-            --body "✅ Auto-approved by AI Gem Upgrade automation — all CI checks passed." \
-            --repo "$REPO"
-
-      # 5️⃣ Merge PR into the Dependabot branch
-      - name: Merge Copilot fix PR
-        if: steps.ci.outputs.can_merge == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GH_PAT_FOR_COPILOT }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          REPO: ${{ github.repository }}
-        run: |
-          gh pr merge "$PR_NUMBER" \
-            --merge \
-            --delete-branch \
-            --admin \
+          set -e
+          gh pr close "$PR_NUMBER" \
             --repo "$REPO" \
-            --subject "fix: AI Gem Upgrade — Copilot fix merged into Dependabot branch" \
-            --body "Auto-merged by AI Gem Upgrade automation after CI passed."
-          echo "✅ Merged Copilot PR #$PR_NUMBER"
+            --comment "Changes from this Copilot branch have been merged directly into $DEPENDABOT_BRANCH by automation."
